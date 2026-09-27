@@ -1,0 +1,9 @@
+.gradle/
+**/build/
+android/local.properties
+*.iml
+.idea/
+__pycache__/
+*.pyc
+.local-secrets/
+local-secrets/

@@ -1,0 +1,117 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Termux client for Hive's authenticated Android abstract Unix socket."""
+import argparse
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+PACKAGE = "io.xprss.hive"
+SOCKET = b"\0io.xprss.hive.privcam.v1"
+COMMANDS = ("start", "end", "status", "camera", "view")
+
+
+def app_uid():
+    # Package manager is the system authority for the installed app's UID.
+    result = subprocess.run(
+        ["/system/bin/pm", "list", "packages", "-U", PACKAGE],
+        text=True, capture_output=True, timeout=10, check=True,
+    )
+    match = re.search(r"^package:io\.xprss\.hive\s+uid:(\d+)\s*$", result.stdout, re.M)
+    if not match:
+        raise RuntimeError("Impossibile verificare l'UID dell'app Hive")
+    return int(match.group(1))
+
+
+def connect():
+    expected = app_uid()
+    subprocess.run(
+        ["/system/bin/am", "start", "-n", PACKAGE + "/.MainActivity"],
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    deadline = time.monotonic() + 15
+    while True:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.connect(SOCKET)
+            credentials = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            _, uid, _ = struct.unpack("3i", credentials)
+            if uid != expected:
+                raise RuntimeError("La socket non appartiene all'app Hive installata")
+            conn.settimeout(3600)
+            return conn
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            conn.close()
+            if time.monotonic() >= deadline:
+                raise RuntimeError("App Hive non raggiungibile; aprila sul telefono")
+            time.sleep(0.3)
+        except Exception:
+            conn.close()
+            raise
+
+
+def request(command):
+    with connect() as conn:
+        conn.sendall(command.encode("ascii") + b"\n")
+        data = bytearray()
+        while len(data) < 8192:
+            part = conn.recv(1)
+            if not part or part == b"\n":
+                break
+            data.extend(part)
+        if len(data) >= 8192:
+            raise RuntimeError("Risposta troppo lunga")
+        return data.decode("utf-8")
+
+
+def print_status(payload):
+    status = json.loads(payload)
+    state = status["state"]
+    if state == "idle":
+        print("Nessuna sessione attiva")
+        return
+    started = datetime.fromtimestamp(status["started"] / 1000).astimezone()
+    print(f"Stato: {state}")
+    print(f"Avvio: {started:%Y-%m-%d %H:%M:%S %Z}")
+    print(f"Foto: {status['photos']}")
+    print(f"Video: {status['videos']}")
+    print(f"Spazio: {status['bytes']} byte")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fotocamera privata Hive per Termux")
+    parser.add_argument("command", nargs="?", choices=COMMANDS)
+    args = parser.parse_args()
+    command = args.command
+    if command is None:
+        print("1) Avvia sessione\n2) Chiudi e pubblica\n3) Stato\n4) Fotocamera\n5) Galleria privata")
+        command = {"1": "start", "2": "end", "3": "status", "4": "camera", "5": "view"}.get(input("> ").strip())
+        if command is None:
+            parser.error("Scelta non valida")
+    try:
+        if command != "status":
+            print("Completa l'operazione nell'app Hive sul telefono…", flush=True)
+        response = request(command)
+        if response.startswith("ERR "):
+            print(response[4:], file=sys.stderr)
+            return 1
+        if not response.startswith("OK "):
+            raise RuntimeError("Risposta non valida")
+        body = response[3:]
+        if command == "status":
+            print_status(body)
+        else:
+            print(body)
+        return 0
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"privcam: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
